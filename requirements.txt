@@ -1,0 +1,6 @@
+langgraph==0.6.6
+langchain==0.3.27
+langchain-community==0.3.27
+langchain-gigachat==0.3.12
+langfuse==3.3.0
+python-dotenv==1.1.1
