@@ -8,9 +8,11 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import create_react_agent
 from langchain_gigachat import GigaChat
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
+from langgraph.prebuilt import ToolNode, tools_condition
 
 # Загружаем переменные окружения
 load_dotenv("config.env")
@@ -28,107 +30,6 @@ langfuse_handler = CallbackHandler(
     update_trace=True
 )
 
-# Определяем простые функции инструментов
-def get_current_time_simple() -> str:
-    """Получает текущее время и дату"""
-    return f"Текущее время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-def calculate_word_count_simple(text: str) -> str:
-    """Подсчитывает количество слов в тексте"""
-    words = text.split()
-    return f"Количество слов в тексте: {len(words)}"
-
-def get_weather_info_simple(city: str = "Moscow") -> str:
-    """Получает информацию о погоде в указанном городе (мок-данные)"""
-    weather_data = {
-        "Moscow": {"temp": "15°C", "condition": "Облачно", "humidity": "65%"},
-        "Saint Petersburg": {"temp": "12°C", "condition": "Дождь", "humidity": "80%"},
-        "Novosibirsk": {"temp": "8°C", "condition": "Солнечно", "humidity": "45%"},
-        "Yekaterinburg": {"temp": "10°C", "condition": "Переменная облачность", "humidity": "60%"}
-    }
-    
-    if city in weather_data:
-        data = weather_data[city]
-        return f"Погода в {city}: {data['temp']}, {data['condition']}, влажность: {data['humidity']}"
-    else:
-        return f"Погода в {city}: 20°C, Солнечно, влажность: 50% (мок-данные)"
-
-def translate_text_simple(text: str, target_language: str = "en") -> str:
-    """Переводит текст на указанный язык (мок-перевод)"""
-    translations = {
-        "en": f"[EN] {text[:100]}...",
-        "es": f"[ES] {text[:100]}...",
-        "fr": f"[FR] {text[:100]}...",
-        "de": f"[DE] {text[:100]}..."
-    }
-    return translations.get(target_language, f"[{target_language.upper()}] {text[:100]}...")
-
-def analyze_sentiment_simple(text: str) -> str:
-    """Анализирует эмоциональную окраску текста"""
-    positive_words = ["хорошо", "отлично", "прекрасно", "великолепно", "замечательно", "позитивно", "успешно"]
-    negative_words = ["плохо", "ужасно", "отвратительно", "негативно", "грустно", "проблема", "ошибка"]
-    
-    text_lower = text.lower()
-    positive_count = sum(1 for word in positive_words if word in text_lower)
-    negative_count = sum(1 for word in negative_words if word in text_lower)
-    
-    if positive_count > negative_count:
-        return "Эмоциональная окраска: Позитивная"
-    elif negative_count > positive_count:
-        return "Эмоциональная окраска: Негативная"
-    else:
-        return "Эмоциональная окраска: Нейтральная"
-
-def generate_summary_simple(text: str, max_length: int = 100) -> str:
-    """Генерирует краткое резюме текста"""
-    words = text.split()
-    if len(words) <= max_length:
-        return text
-    else:
-        summary = " ".join(words[:max_length]) + "..."
-        return f"Краткое резюме: {summary}"
-
-# Определяем инструменты LangChain (для совместимости)
-@tool
-def get_current_time() -> str:
-    """Получает текущее время и дату"""
-    return get_current_time_simple()
-
-@tool
-def calculate_word_count(text: str) -> str:
-    """Подсчитывает количество слов в тексте"""
-    return calculate_word_count_simple(text)
-
-@tool
-def get_weather_info(city: str = "Moscow") -> str:
-    """Получает информацию о погоде в указанном городе (мок-данные)"""
-    return get_weather_info_simple(city)
-
-@tool
-def translate_text(text: str, target_language: str = "en") -> str:
-    """Переводит текст на указанный язык (мок-перевод)"""
-    return translate_text_simple(text, target_language)
-
-@tool
-def analyze_sentiment(text: str) -> str:
-    """Анализирует эмоциональную окраску текста"""
-    return analyze_sentiment_simple(text)
-
-@tool
-def generate_summary(text: str, max_length: int = 100) -> str:
-    """Генерирует краткое резюме текста"""
-    return generate_summary_simple(text, max_length)
-
-# Список всех доступных инструментов
-available_tools = [
-    get_current_time,
-    calculate_word_count,
-    get_weather_info,
-    translate_text,
-    analyze_sentiment,
-    generate_summary
-]
-
 # Определяем структуру состояния
 class AgentState(TypedDict):
     messages: List[Any]
@@ -139,11 +40,17 @@ class AgentState(TypedDict):
     final_result: str
     tools_used: List[str]  # Список использованных инструментов
     tool_results: Dict[str, str]  # Результаты работы инструментов
+    tools: List[Dict[str, Any]]  # Результаты от ToolNode
+    needs_revision: bool  # Флаг необходимости доработки контента
+    revision_count: int  # Счетчик итераций доработки
 
-# Инициализируем GigaChat с Langfuse callback
+# Инициализируем GigaChat с Langfuse callback и увеличенными таймаутами
 llm = GigaChat(
     credentials=os.getenv("GIGACHAT_API_KEY"),
     verify_ssl_certs=False,
+    timeout=120.0,  # Увеличиваем таймаут до 2 минут
+    request_timeout=120.0,  # Таймаут для HTTP-запросов
+    max_retries=3,  # Количество попыток при ошибке
 )
 
 # Определяем агентов
@@ -173,20 +80,47 @@ def create_analyst_agent():
     return analyst
 
 def create_writer_agent():
-    """Агент-писатель: создает контент на основе анализа"""
+    """Агент-писатель: создает контент на основе анализа и учитывает критику"""
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """Ты талантливый писатель. Создай качественный контент на основе предоставленного анализа.
-        Будь креативным, но следуй структуре и рекомендациям аналитика."""),
-        ("user", "Анализ: {analysis}\n\nСоздай контент на основе этого анализа.")
+        ("system", """Ты талантливый писатель. Создай качественный, структурированный контент на основе предоставленного анализа.
+        
+        Если есть критика от редактора, обязательно учти все замечания и улучши контент.
+        Пиши ясно, логично и увлекательно."""),
+        ("user", """Тема: {topic}
+Анализ: {analysis}
+Предыдущий контент: {content}
+Критика редактора: {feedback}
+
+Если это первая версия (нет предыдущего контента), создай новый материал. 
+Если есть критика, улучши существующий контент, учитывая все замечания редактора.""")
     ])
     
     def writer(state: AgentState) -> AgentState:
-        messages = prompt.format_messages(analysis=state["analysis"])
+        print("DEBUG: Писатель начал работу")
+        
+        # Проверяем, есть ли уже контент (это доработка)
+        is_revision = bool(state.get("content", "").strip())
+        if is_revision:
+            # Увеличиваем счетчик доработок
+            state["revision_count"] = state.get("revision_count", 0) + 1
+            print(f"DEBUG: Писатель дорабатывает контент на основе критики (итерация {state['revision_count']})")
+        else:
+            # Инициализируем счетчик для первого контента
+            state["revision_count"] = 0
+            print("DEBUG: Писатель создает первичный контент")
+            
+        messages = prompt.format_messages(
+            topic=state["topic"],
+            analysis=state["analysis"],
+            content=state.get("content", ""),
+            feedback=state.get("feedback", "")
+        )
         try:
             response = llm.invoke(messages)
             state["content"] = response.content
             state["messages"].append(AIMessage(content=f"Контент: {response.content}"))
             print(f"DEBUG: Писатель получил ответ длиной {len(response.content)} символов")
+            print("DEBUG: Писатель завершил работу")
         except Exception as e:
             print(f"DEBUG: Ошибка писателя: {e}")
             state["content"] = f"Ошибка создания контента: {e}"
@@ -195,14 +129,26 @@ def create_writer_agent():
     return writer
 
 def create_critic_agent():
-    """Агент-критик: оценивает и улучшает контент"""
+    """Агент-критик: оценивает контент и принимает решение о необходимости доработки"""
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """Ты строгий критик и редактор. Оцени контент и предложи улучшения.
-        Будь конструктивным и конкретным в своих замечаниях."""),
-        ("user", "Тема: {topic}\nАнализ: {analysis}\nКонтент: {content}\n\nОцени этот контент и предложи улучшения.")
+        ("system", """Ты строгий критик и редактор. Твоя задача - проанализировать контент и принять решение о его качестве.
+
+Критерии оценки:
+- Структура и логика изложения
+- Полнота раскрытия темы  
+- Качество и ясность текста
+- Соответствие теме
+
+ВАЖНО: В конце своей критики ты ДОЛЖЕН явно указать одно из решений:
+- "РЕШЕНИЕ: ДОРАБОТАТЬ" - если контент требует значительных улучшений
+- "РЕШЕНИЕ: ПРИНЯТЬ" - если контент достаточно хорош и готов к финализации
+
+Дай конструктивную обратную связь с конкретными предложениями по улучшению."""),
+        ("user", "Тема: {topic}\nАнализ: {analysis}\nКонтент: {content}\n\nОцени этот контент и дай подробную критику с решением о дальнейших действиях.")
     ])
     
     def critic(state: AgentState) -> AgentState:
+        print("DEBUG: Критик начал работу")
         messages = prompt.format_messages(
             topic=state["topic"],
             analysis=state["analysis"],
@@ -211,155 +157,273 @@ def create_critic_agent():
         response = llm.invoke(messages)
         state["feedback"] = response.content
         state["messages"].append(AIMessage(content=f"Критика: {response.content}"))
+        
+        # Определяем решение критика
+        if "РЕШЕНИЕ: ДОРАБОТАТЬ" in response.content:
+            state["needs_revision"] = True
+            print("DEBUG: Критик решил, что контент нужно доработать")
+        elif "РЕШЕНИЕ: ПРИНЯТЬ" in response.content:
+            state["needs_revision"] = False
+            print("DEBUG: Критик принял контент")
+        else:
+            # По умолчанию считаем, что нужна доработка, если решение неясно
+            state["needs_revision"] = True
+            print("DEBUG: Критик не дал четкого решения, отправляем на доработку")
+            
+        print("DEBUG: Критик завершил работу")
         return state
     
     return critic
 
-def create_finalizer_agent():
-    """Финальный агент: создает итоговый результат"""
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """Ты финальный редактор. Создай итоговую версию контента, учитывая все замечания критика.
-        Объедини лучшие части и создай финальный результат."""),
-        ("user", "Тема: {topic}\nАнализ: {analysis}\nКонтент: {content}\nКритика: {feedback}\n\nСоздай финальную версию.")
-    ])
-    
-    def finalizer(state: AgentState) -> AgentState:
-        messages = prompt.format_messages(
-            topic=state["topic"],
-            analysis=state["analysis"],
-            content=state["content"],
-            feedback=state["feedback"]
-        )
-        response = llm.invoke(messages)
-        state["final_result"] = response.content
-        state["messages"].append(AIMessage(content=f"Финальный результат: {response.content}"))
-        return state
-    
-    return finalizer
+
 
 def create_tools_agent():
-    """Агент-инструментарий: использует различные инструменты для обогащения контента"""
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """Ты агент-инструментарий. Твоя задача - использовать доступные инструменты для обогащения и улучшения контента.
+    """Агент-инструментарий с использованием ToolNode"""
+    
+    @tool
+    def analyze_text(text: str) -> str:
+        """
+        Анализирует текст и возвращает полезную информацию о нем.
         
-        Доступные инструменты:
-        - get_current_time: получить текущее время
-        - calculate_word_count: подсчитать количество слов в тексте
-        - get_weather_info: получить информацию о погоде
-        - translate_text: перевести текст на другой язык
-        - analyze_sentiment: проанализировать эмоциональную окраску текста
-        - generate_summary: создать краткое резюме текста
-        
-        Используй инструменты для добавления полезной информации к контенту."""),
-        ("user", "Тема: {topic}\nАнализ: {analysis}\nКонтент: {content}\nКритика: {feedback}\n\nИспользуй инструменты для обогащения контента.")
-    ])
+        Args:
+            text: Текст для анализа
+        """
+        try:
+            # Подсчет слов
+            words = text.split()
+            word_count = len(words)
+            
+            # Простой анализ настроения
+            positive_words = ['хорошо', 'отлично', 'прекрасно', 'замечательно', 'удивительно', 'великолепно']
+            negative_words = ['плохо', 'ужасно', 'отвратительно', 'ужас', 'кошмар', 'отвратительно']
+            
+            text_lower = text.lower()
+            positive_count = sum(1 for word in positive_words if word in text_lower)
+            negative_count = sum(1 for word in negative_words if word in text_lower)
+            
+            if positive_count > negative_count:
+                sentiment = "Положительная"
+            elif negative_count > positive_count:
+                sentiment = "Отрицательная"
+            else:
+                sentiment = "Нейтральная"
+            
+            # Подсчет предложений (простой способ)
+            sentences = text.split('.')
+            sentence_count = len([s for s in sentences if s.strip()])
+            
+            # Средняя длина предложения
+            avg_sentence_length = word_count / sentence_count if sentence_count > 0 else 0
+            
+            # Текущее время
+            from datetime import datetime
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Формируем результат анализа
+            analysis_result = f"""
+📊 АНАЛИЗ ТЕКСТА:
+⏰ Время анализа: {current_time}
+📝 Количество слов: {word_count}
+📄 Количество предложений: {sentence_count}
+📏 Средняя длина предложения: {avg_sentence_length:.1f} слов
+😊 Эмоциональная окраска: {sentiment}
+            """.strip()
+            
+            return analysis_result
+            
+        except Exception as e:
+            return f"Ошибка при анализе текста: {str(e)}"
+    
+    # Создаем инструменты
+    tools = [analyze_text]
     
     def tools_agent(state: AgentState) -> AgentState:
-        print("DEBUG: Агент-инструментарий начал работу")
+        print("DEBUG: ToolNode агент-инструментарий начал работу")
         
-        # Используем несколько инструментов
-        tools_results = {}
-        tools_used = []
-        
-        # Получаем текущее время
-        current_time = get_current_time_simple()
-        tools_results["current_time"] = current_time
-        tools_used.append("get_current_time")
-        
-        # Подсчитываем количество слов в контенте
-        word_count = calculate_word_count_simple(state["content"])
-        tools_results["word_count"] = word_count
-        tools_used.append("calculate_word_count")
-        
-        # Анализируем эмоциональную окраску
-        sentiment = analyze_sentiment_simple(state["content"])
-        tools_results["sentiment"] = sentiment
-        tools_used.append("analyze_sentiment")
-        
-        # Создаем краткое резюме
-        summary = generate_summary_simple(state["content"], 50)
-        tools_results["summary"] = summary
-        tools_used.append("generate_summary")
-        
-        # Получаем информацию о погоде
-        weather = get_weather_info_simple("Moscow")
-        tools_results["weather"] = weather
-        tools_used.append("get_weather_info")
-        
-        # Обновляем состояние
-        state["tools_used"] = tools_used
-        state["tool_results"] = tools_results
-        
-        # Создаем обогащенный контент
-        enriched_content = f"""
+        try:
+            # Всегда анализируем контент с помощью инструмента
+            text_to_analyze = state["content"]
+            print(f"DEBUG: Анализируем текст длиной {len(text_to_analyze)} символов")
+            
+            # Вызываем инструмент напрямую
+            analysis_result = analyze_text.invoke({"text": text_to_analyze})
+            
+            # Обогащаем контент результатами анализа
+            enriched_content = f"""
 {state["content"]}
 
 ---
-📊 ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ:
+{analysis_result}
+            """.strip()
+            
+            # Обновляем состояние
+            state["tools_used"] = ["analyze_text"]
+            state["tool_results"] = {"text_analysis": analysis_result}
+            state["content"] = enriched_content
+            state["messages"].append(AIMessage(content=f"Обогащенный контент: {enriched_content[:200]}..."))
+            
+            print(f"DEBUG: ToolNode агент использовал инструмент: analyze_text")
+            print(f"DEBUG: Результат анализа получен")
+            
+        except Exception as e:
+            print(f"DEBUG: Ошибка ToolNode агента: {e}")
+            # Fallback к простому анализу
+            from datetime import datetime
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            word_count = len(state["content"].split())
+            
+            tools_results = {
+                "analyze_text": f"Простой анализ: {word_count} слов, Время: {current_time}"
+            }
+            tools_used = ["analyze_text"]
+            
+            state["tools_used"] = tools_used
+            state["tool_results"] = tools_results
+            
+            enriched_content = f"""
+{state["content"]}
+
+---
+📊 ПРОСТОЙ АНАЛИЗ:
 ⏰ {current_time}
-📝 {word_count}
-😊 {sentiment}
-🌤️ {weather}
-📋 {summary}
-        """.strip()
+📝 Количество слов: {word_count}
+❌ Произошла ошибка при использовании ToolNode агента
+            """.strip()
+            
+            state["content"] = enriched_content
         
-        state["content"] = enriched_content
-        state["messages"].append(AIMessage(content=f"Обогащенный контент с инструментами: {enriched_content[:200]}..."))
-        
-        print("DEBUG: Агент-инструментарий завершил работу")
+        print("DEBUG: ToolNode агент-инструментарий завершил работу")
         return state
     
     return tools_agent
 
+# Функция принятия решения для условного перехода
+def should_continue(state: AgentState) -> str:
+    """Определяет, нужна ли доработка контента или можно финализировать"""
+    max_revisions = 3  # Максимальное количество доработок
+    current_revisions = state.get("revision_count", 0)
+    
+    if state.get("needs_revision", True) and current_revisions < max_revisions:
+        print(f"DEBUG: Отправляем контент на доработку писателю (итерация {current_revisions + 1}/{max_revisions})")
+        return "writer"
+    else:
+        if current_revisions >= max_revisions:
+            print(f"DEBUG: Достигнут лимит доработок ({max_revisions}), переходим к инструментам")
+        else:
+            print("DEBUG: Контент принят, переходим к инструментам")
+        return "tools"
+
 # Создаем граф агентов
 def create_agent_graph():
-    """Создает граф мультиагентной системы"""
+    """Создает граф мультиагентной системы с простой нодой для инструментов"""
     
     # Создаем граф
     workflow = StateGraph(AgentState)
+    
+    # Создаем простую функцию для анализа текста
+    def analyze_text_node(state: AgentState) -> AgentState:
+        """Нода для анализа текста с помощью инструмента"""
+        print("DEBUG: Анализ текста с помощью инструмента")
+        
+        try:
+            # Создаем инструмент
+            @tool
+            def analyze_text(text: str) -> str:
+                """Анализирует текст и возвращает статистику"""
+                try:
+                    words = text.split()
+                    word_count = len(words)
+                    sentences = text.split('.')
+                    sentence_count = len([s for s in sentences if s.strip()])
+                    
+                    from datetime import datetime
+                    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    return f"""
+📊 АНАЛИЗ ТЕКСТА:
+⏰ Время анализа: {current_time}
+📝 Количество слов: {word_count}
+📄 Количество предложений: {sentence_count}
+                    """.strip()
+                except Exception as e:
+                    return f"Ошибка при анализе текста: {str(e)}"
+            
+            # Анализируем контент
+            text_to_analyze = state["content"]
+            analysis_result = analyze_text.invoke({"text": text_to_analyze})
+            
+            # Обогащаем контент результатами анализа
+            enriched_content = f"""
+{state["content"]}
+
+---
+{analysis_result}
+            """.strip()
+            
+            # Обновляем состояние
+            state["tools_used"] = ["analyze_text"]
+            state["tool_results"] = {"analyze_text": analysis_result}
+            state["content"] = enriched_content
+            state["messages"].append(AIMessage(content=f"Обогащенный контент: {enriched_content[:200]}..."))
+            
+            print(f"DEBUG: Контент обогащен результатами анализа")
+            
+        except Exception as e:
+            print(f"DEBUG: Ошибка анализа текста: {e}")
+            # Fallback к простому анализу
+            from datetime import datetime
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            word_count = len(state["content"].split())
+            
+            tools_results = {
+                "text_analysis": f"Простой анализ: {word_count} слов, Время: {current_time}"
+            }
+            tools_used = ["analyze_text"]
+            
+            state["tools_used"] = tools_used
+            state["tool_results"] = tools_results
+            
+            enriched_content = f"""
+{state["content"]}
+
+---
+📊 ПРОСТОЙ АНАЛИЗ:
+⏰ {current_time}
+📝 Количество слов: {word_count}
+❌ Произошла ошибка при использовании инструмента анализа
+            """.strip()
+            
+            state["content"] = enriched_content
+        
+        return state
     
     # Добавляем узлы (агентов)
     workflow.add_node("analyst", create_analyst_agent())
     workflow.add_node("writer", create_writer_agent())
     workflow.add_node("critic", create_critic_agent())
-    workflow.add_node("tools", create_tools_agent())
-    workflow.add_node("finalizer", create_finalizer_agent())
+    workflow.add_node("tools", analyze_text_node)
     
     # Определяем поток выполнения
     workflow.set_entry_point("analyst")
     workflow.add_edge("analyst", "writer")
     workflow.add_edge("writer", "critic")
-    workflow.add_edge("critic", "tools")
-    workflow.add_edge("tools", "finalizer")
-    workflow.add_edge("finalizer", END)
+    
+    # Условный переход от критика
+    workflow.add_conditional_edges(
+        "critic",
+        should_continue,
+        {
+            "writer": "writer",  # Если нужна доработка - обратно к писателю
+            "tools": "tools"     # Если контент принят - к инструментам
+        }
+    )
+    
+    workflow.add_edge("tools", END)
     
     return workflow.compile().with_config(callbacks=[langfuse_handler])
 
-# Создаем граф агентов с Langfuse трассировкой
-def create_agent_graph_with_langfuse():
-    """Создает граф мультиагентной системы с Langfuse трассировкой"""
-    
-    # Создаем граф
-    workflow = StateGraph(AgentState)
-    
-    # Добавляем узлы (агентов)
-    workflow.add_node("analyst", create_analyst_agent())
-    workflow.add_node("writer", create_writer_agent())
-    workflow.add_node("critic", create_critic_agent())
-    workflow.add_node("finalizer", create_finalizer_agent())
-    
-    # Определяем поток выполнения
-    workflow.set_entry_point("analyst")
-    workflow.add_edge("analyst", "writer")
-    workflow.add_edge("writer", "critic")
-    workflow.add_edge("critic", "finalizer")
-    workflow.add_edge("finalizer", END)
-    
-    # Компилируем с Langfuse callback
-    return workflow.compile(checkpointer=None, interrupt_before=["analyst", "writer", "critic", "finalizer"])
-
 # Функция для запуска мультиагентной системы
-def run_multi_agent_system(topic: str, use_langfuse: bool = True) -> Dict[str, Any]:
+def run_multi_agent_system(topic: str) -> Dict[str, Any]:
     """
     Запускает мультиагентную систему для обработки заданной темы
     
@@ -371,10 +435,7 @@ def run_multi_agent_system(topic: str, use_langfuse: bool = True) -> Dict[str, A
         Результат работы системы
     """
     # Создаем граф
-    if use_langfuse:
-        graph = create_agent_graph_with_langfuse()
-    else:
-        graph = create_agent_graph()
+    graph = create_agent_graph()
     
     # Инициализируем состояние
     initial_state = AgentState(
@@ -385,25 +446,21 @@ def run_multi_agent_system(topic: str, use_langfuse: bool = True) -> Dict[str, A
         feedback="",
         final_result="",
         tools_used=[],
-        tool_results={}
+        tool_results={},
+        tools=[],  # Результаты от ToolNode
+        needs_revision=False,
+        revision_count=0
     )
     
     # Запускаем систему
-    if use_langfuse:
-        print("DEBUG: Запуск с Langfuse мониторингом...")
-        # Langfuse автоматически трассирует LLM вызовы через callback handler
-        result = graph.invoke(initial_state)
-        print("DEBUG: Граф выполнен успешно с Langfuse")
-    else:
-        print("DEBUG: Запуск без Langfuse...")
-        result = graph.invoke(initial_state)
+    result = graph.invoke(initial_state)
     
     return {
         "topic": result["topic"],
         "analysis": result["analysis"],
         "content": result["content"],
         "feedback": result["feedback"],
-        "final_result": result["final_result"],
+        "final_result": result["content"],  # Используем content как финальный результат
         "messages": result["messages"],
         "tools_used": result.get("tools_used", []),
         "tool_results": result.get("tool_results", {})
@@ -435,7 +492,7 @@ if __name__ == "__main__":
     
     try:
         # Используем Langfuse только для мониторинга, не для трассировки графа
-        result = run_multi_agent_system(test_topic, use_langfuse=False)
+        result = run_multi_agent_system(test_topic)
         
         print("\n📊 АНАЛИЗ:")
         print(result["analysis"])
@@ -450,7 +507,7 @@ if __name__ == "__main__":
         print("\n" + "="*50)
         
         print("\n🎯 ФИНАЛЬНЫЙ РЕЗУЛЬТАТ:")
-        print(result["final_result"])
+        print(result["content"])
         print("\n" + "="*50)
         
         # Показываем информацию об использованных инструментах
